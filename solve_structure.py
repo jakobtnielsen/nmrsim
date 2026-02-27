@@ -748,6 +748,50 @@ def run_lsd(atom_nodes: list, constraints: dict, fragments: dict,
     return smiles_list, lsd_text
 
 
+def run_lsd_iterative(atom_nodes: list, constraints: dict, fragments: dict,
+                      molecular_formula: str = "",
+                      lsd_timeout: int = 60) -> tuple:
+    """
+    Run LSD with progressively relaxed ELIM parameters until solutions appear.
+
+    Pass schedule
+    -------------
+    1. strict            — ELIM  2 4  (default; catches well-constrained molecules)
+    2. elim5             — ELIM  5 4  (5 unsatisfied correlations allowed)
+    3. elim10            — ELIM 10 4  (further relaxation)
+    4. elim10_nocosy     — ELIM 10 4, COSY constraints dropped
+    5. elim20_nocosy_p3  — ELIM 20 3, COSY constraints dropped  (max relaxation)
+
+    Dropping COSY in passes 4-5 handles over-constrained sp3 chains where
+    COSY constraints conflict with contradictory HMBC evidence.
+
+    Returns
+    -------
+    (smiles_list, lsd_text, pass_label)
+        smiles_list : deduplicated canonical SMILES (empty list if all passes fail)
+        lsd_text    : LSD input file from the *last attempted* pass (for debugging)
+        pass_label  : str identifying the successful pass, or 'failed'
+    """
+    passes = [
+        (2,  4, False, "strict"),
+        (5,  4, False, "elim5"),
+        (10, 4, False, "elim10"),
+        (10, 4, True,  "elim10_nocosy"),
+        (20, 3, True,  "elim20_nocosy_p3"),
+    ]
+    last_text = ""
+    for elim_n, elim_p, drop_cosy, label in passes:
+        frags_mod = {**fragments, 'elim': (elim_n, elim_p)}
+        cons_mod  = {**constraints, 'cosy': [] if drop_cosy else constraints['cosy']}
+        smiles, lsd_text = run_lsd(
+            atom_nodes, cons_mod, frags_mod, molecular_formula, lsd_timeout,
+        )
+        last_text = lsd_text
+        if smiles:
+            return smiles, lsd_text, label
+    return [], last_text, "failed"
+
+
 # ---------------------------------------------------------------------------
 # Stage 5: Rank by 13C shift MAE
 # ---------------------------------------------------------------------------

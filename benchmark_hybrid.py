@@ -32,11 +32,13 @@ from build_2d import (
     _representative,
 )
 from collapse_peaks import collapse_2d_peaks
+from predict_shifts import predict_shifts, BackendError
 from solve_structure import (
     extract_atom_nodes,
     extract_constraints,
     detect_fragments,
     run_lsd,
+    run_lsd_iterative,
     rank_candidates,
 )
 from score_answer import tanimoto_similarity
@@ -335,6 +337,37 @@ def build_c13_spectrum(chsqc_content: str, assign_content: str) -> list:
     return c13_list
 
 
+def _build_c13_from_shifts(c_shifts: dict, chsqc_content: str) -> list:
+    """
+    Build a 1D 13C spectrum list from a complete {rdkit_c_idx: c_ppm} dict.
+
+    Uses CHSQC table to determine n_h and h_ppm for each CH carbon.
+    Quaternary carbons (not in CHSQC) get n_h=0 and h_ppm=None.
+
+    Returns [{"c_ppm": float, "n_h": int, "h_ppm": float|None}, ...].
+    """
+    c_to_h_ppms: dict = defaultdict(list)
+    for line in chsqc_content.strip().splitlines():
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            c_num = int(parts[3].strip())
+            h_ppm = float(parts[4].strip())
+        except (ValueError, IndexError):
+            continue
+        c_to_h_ppms[c_num].append(round(h_ppm, 4))
+
+    c13 = []
+    for c_rdkit, c_ppm in sorted(c_shifts.items()):
+        c_num = c_rdkit + 1
+        hs    = c_to_h_ppms.get(c_num, [])
+        n_h   = len(hs)
+        h_ppm = round(sum(hs) / len(hs), 4) if hs else None
+        c13.append({"c_ppm": round(c_ppm, 4), "n_h": n_h, "h_ppm": h_ppm})
+    return c13
+
+
 # ---------------------------------------------------------------------------
 # Per-compound pipeline
 # ---------------------------------------------------------------------------
@@ -345,7 +378,8 @@ def _molecular_formula(mol) -> str:
 
 def run_compound(entry: dict, zf: zipfile.ZipFile,
                  chsqc_map: dict, assign_map: dict,
-                 max_candidates: int = 50) -> dict:
+                 max_candidates: int = 50,
+                 lsd_timeout: int = 30) -> dict:
     """
     Run the hybrid elucidation pipeline for one compound.
 
@@ -374,19 +408,48 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
         h_shifts_exp, c_shifts_exp = parse_assign_table(assign_content)
         hsqc_peaks = parse_chsqc_table(chsqc_content)
 
-        # --- Build 1D 13C spectrum (includes quaternary C) ---
-        c13 = build_c13_spectrum(chsqc_content, assign_content)
-
         # --- Supplement missing shifts from CHSQC when assign table is partial ---
         # Some assign tables have only H entries (no C) or only C entries (no H).
         # CHSQC provides reliable fallback values for both, keyed by atom index.
         c_shifts_chsqc = _c_shifts_from_chsqc(chsqc_content)
+        # Filter CHSQC entries to actual C atom indices.  NP-MRD canonical
+        # atom numbers may differ from the current RDKit canonicalization for
+        # some molecules, producing out-of-range or non-C atom indices that
+        # would inflate the C count.
+        c_atom_indices = {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 6}
+        c_shifts_chsqc = {k: v for k, v in c_shifts_chsqc.items() if k in c_atom_indices}
         h_shifts_chsqc = _h_shifts_from_chsqc(mol_h, chsqc_content)
         # Merge: experimental assign table overrides CHSQC for overlapping atoms
         c_shifts_merged = {**c_shifts_chsqc, **c_shifts_exp}
         h_shifts_merged = {**h_shifts_chsqc, **h_shifts_exp}
 
+        # --- Supplement missing quaternary C shifts (H-only assign tables) ---
+        # When the assign table has no C entries, c_shifts_merged contains only
+        # CHSQC-derived CH carbons.  Quaternary C atoms (no attached H) have
+        # no c_ppm → HMBC cannot reach them → LSD gets wrong atom count → 0 solutions.
+        # Fix: use predicted 13C shifts from NMRShiftDB for the missing carbons.
+        formula_c = sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6)
+        if len(c_shifts_merged) < formula_c:
+            try:
+                canon_smi = Chem.MolToSmiles(mol)
+                pred = predict_shifts(canon_smi, backend='nmrshiftdb')
+                for idx, c_ppm in (pred.get('c_shifts') or {}).items():
+                    if idx not in c_shifts_merged:
+                        c_shifts_merged[idx] = c_ppm
+            except (BackendError, Exception):
+                pass  # fall through; quaternary C will be detected via HMBC only
+
+        # --- Build 1D 13C spectrum (includes quaternary C) ---
+        # Always build from c_shifts_merged so that supplemented quat C is included.
+        # For compounds with full C entries the assign-table c13 equals this result.
+        c13 = build_c13_spectrum(chsqc_content, assign_content)
+        if len(c13) < formula_c and len(c_shifts_merged) >= formula_c:
+            # Assign table was incomplete; rebuild from the augmented shifts dict
+            c13 = _build_c13_from_shifts(c_shifts_merged, chsqc_content)
+
         # --- Build semi-simulated HMBC and COSY ---
+        # Use the final (possibly augmented) c_shifts_merged so that HMBC peaks
+        # to quaternary C atoms are included when their shifts are now known.
         hmbc_raw = build_hmbc_exp(mol_h, h_shifts_merged, c_shifts_merged)
         cosy_raw = build_cosy_exp(mol_h, h_shifts_merged)
 
@@ -410,11 +473,14 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
             },
         }
 
-        # --- Run LSD ---
+        # --- Run LSD (iterative ELIM relaxation) ---
         atom_nodes  = extract_atom_nodes(problem)
         constraints = extract_constraints(problem, atom_nodes)
         fragments   = detect_fragments(atom_nodes, formula)
-        smiles_list, lsd_text = run_lsd(atom_nodes, constraints, fragments, formula)
+        smiles_list, lsd_text, lsd_pass = run_lsd_iterative(
+            atom_nodes, constraints, fragments, formula,
+            lsd_timeout=lsd_timeout,
+        )
         lsd_count = len(smiles_list)
 
         base_fields = {
@@ -425,6 +491,7 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
             "n_cosy":     len(cosy),
             "h_assigned": len(h_shifts_exp),
             "c_assigned": len(c_shifts_exp),
+            "lsd_pass":   lsd_pass,
         }
 
         if lsd_count == 0:
@@ -473,7 +540,8 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
                   zip_path: str = ZIP_PATH,
                   output_dir: str = OUTPUT_DIR,
                   max_candidates: int = 50,
-                  output_prefix: str = "hybrid_benchmark") -> None:
+                  output_prefix: str = "hybrid_benchmark",
+                  lsd_timeout: int = 30) -> None:
 
     os.makedirs(output_dir, exist_ok=True)
     csv_path  = os.path.join(output_dir, f"{output_prefix}.csv")
@@ -500,7 +568,7 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
             n_c  = entry.get("n_carbons", "?")
             print(f"[{i:2d}/{len(runnable)}] {npid} ({n_c}C) … ", end="", flush=True)
 
-            r = run_compound(entry, zf, chsqc_map, assign_map, max_candidates)
+            r = run_compound(entry, zf, chsqc_map, assign_map, max_candidates, lsd_timeout)
             results.append(r)
 
             if r.get("error"):
@@ -508,8 +576,8 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
             else:
                 rank_str = (f"rank={r['gt_rank']}" if r["gt_rank"]
                             else f"tanimoto={r['gt_tanimoto']}")
-                c13_str = f", C13={r.get('n_c13', '-')}" if r.get('n_c13') else ""
-                print(f"LSD={r['lsd_count']} solutions, GT {rank_str}  "
+                c13_str  = f", C13={r.get('n_c13', '-')}" if r.get('n_c13') else ""
+                print(f"LSD={r['lsd_count']} solutions ({r.get('lsd_pass','?')}), GT {rank_str}  "
                       f"[HSQC={r['n_hsqc']}{c13_str}, HMBC={r['n_hmbc']}, COSY={r['n_cosy']}]")
 
     # --- Summary ---
@@ -547,7 +615,7 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
         "np_mrd_id", "smiles", "formula",
         "n_hsqc", "n_c13", "n_hmbc", "n_cosy",
         "h_assigned", "c_assigned",
-        "lsd_count", "gt_rank", "gt_tanimoto", "error",
+        "lsd_count", "lsd_pass", "gt_rank", "gt_tanimoto", "error",
     ]
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=csv_fields, extrasaction="ignore")
@@ -579,6 +647,8 @@ def _cli() -> None:
     p.add_argument("--zip",            default=ZIP_PATH)
     p.add_argument("--output-dir",     default=OUTPUT_DIR)
     p.add_argument("--max-candidates", type=int, default=50)
+    p.add_argument("--lsd-timeout",    type=int, default=30,
+                   help="LSD timeout in seconds per pass (default 30)")
     args = p.parse_args()
 
     if args.v2:
@@ -588,7 +658,8 @@ def _cli() -> None:
         testset = args.testset or TESTSET_PATH
         prefix  = "hybrid_benchmark"
 
-    run_benchmark(testset, args.zip, args.output_dir, args.max_candidates, prefix)
+    run_benchmark(testset, args.zip, args.output_dir, args.max_candidates, prefix,
+                  args.lsd_timeout)
 
 
 if __name__ == "__main__":

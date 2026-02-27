@@ -20,6 +20,7 @@ from solve_structure import (
     extract_constraints,
     detect_fragments,
     run_lsd,
+    run_lsd_iterative,
     solve,
     _parse_formula,
     _build_lsd_text,
@@ -381,6 +382,56 @@ def test_run_lsd_no_solutions_impossible():
     smiles, _ = run_lsd(nodes, constraints, fragments, "CH4")
     # LSD should find 1 solution (methane) or 0
     assert isinstance(smiles, list)
+
+
+@pytest.mark.skipif(not _HAS_LSD, reason="LSD binary not found")
+def test_run_lsd_iterative_ethane():
+    """Iterative wrapper finds ethane on the strict pass."""
+    problem = {
+        "molecular_formula": "C2H6",
+        "spectra": {
+            "hsqc": [
+                {"c_ppm": 15.0, "h_ppm": 1.2, "n_h": 3},
+                {"c_ppm": 5.0,  "h_ppm": 0.9, "n_h": 3},
+            ],
+            "hmbc": [],
+            "cosy": [
+                {"h1_ppm": 1.2, "h2_ppm": 0.9},
+                {"h1_ppm": 0.9, "h2_ppm": 1.2},
+            ],
+            "h1_1d": None,
+        },
+    }
+    nodes       = extract_atom_nodes(problem)
+    constraints = extract_constraints(problem, nodes)
+    fragments   = detect_fragments(nodes, "C2H6")
+    smiles, lsd_text, pass_label = run_lsd_iterative(nodes, constraints, fragments, "C2H6")
+    assert isinstance(smiles, list)
+    assert "CC" in smiles
+    assert pass_label == "strict"
+    assert isinstance(lsd_text, str)
+
+
+@pytest.mark.skipif(not _HAS_LSD, reason="LSD binary not found")
+def test_run_lsd_iterative_returns_three_values():
+    """run_lsd_iterative always returns (list, str, str)."""
+    problem = {
+        "molecular_formula": "C2H6",
+        "spectra": {
+            "hsqc": [{"c_ppm": 15.0, "h_ppm": 1.2, "n_h": 3},
+                     {"c_ppm": 5.0,  "h_ppm": 0.9, "n_h": 3}],
+            "hmbc": [], "cosy": [], "h1_1d": None,
+        },
+    }
+    nodes       = extract_atom_nodes(problem)
+    constraints = extract_constraints(problem, nodes)
+    fragments   = detect_fragments(nodes, "C2H6")
+    result = run_lsd_iterative(nodes, constraints, fragments, "C2H6")
+    assert len(result) == 3
+    smiles, lsd_text, label = result
+    assert isinstance(smiles, list)
+    assert isinstance(lsd_text, str)
+    assert isinstance(label, str)
 
 
 # ---------------------------------------------------------------------------
