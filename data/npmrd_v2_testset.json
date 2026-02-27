@@ -1,0 +1,128 @@
+[
+  {
+    "np_mrd_id": "NP0044219",
+    "smiles": "OCC1OC(CC1O)N1C=CC(=O)NC1=O",
+    "molecular_formula": "C9H12N2O5",
+    "n_carbons": 9,
+    "dbe": 5.0,
+    "quat_frac": 0.22,
+    "close_pairs": 0
+  },
+  {
+    "np_mrd_id": "NP0000377",
+    "smiles": "N[C@@H](Cc1ccc(O)cc1)C(=O)O",
+    "molecular_formula": "C9H11NO3",
+    "n_carbons": 9,
+    "dbe": 5.0,
+    "quat_frac": 0.33,
+    "close_pairs": 0
+  },
+  {
+    "np_mrd_id": "NP0000860",
+    "smiles": "NC1=C2N=CN([C@@H]3O[C@H](CO)[C@@H](O)[C@H]3O)C2=NC=N1",
+    "molecular_formula": "C10H13N5O4",
+    "n_carbons": 10,
+    "dbe": 7.0,
+    "quat_frac": 0.3,
+    "close_pairs": 1
+  },
+  {
+    "np_mrd_id": "NP0001335",
+    "smiles": "NC1=NC2=C(N=CN2[C@@H]2O[C@H](CO)[C@@H](O)[C@H]2O)C(=O)N1",
+    "molecular_formula": "C10H13N5O5",
+    "n_carbons": 10,
+    "dbe": 7.0,
+    "quat_frac": 0.4,
+    "close_pairs": 1
+  },
+  {
+    "np_mrd_id": "NP0048592",
+    "smiles": "C=C1C(=O)OC2C/C(C)=C\\CC/C(C)=C\\C(OC(C)=O)C12",
+    "molecular_formula": "C17H22O4",
+    "n_carbons": 17,
+    "dbe": 7.0,
+    "quat_frac": 0.29,
+    "close_pairs": 2
+  },
+  {
+    "np_mrd_id": "NP0000919",
+    "smiles": "OC[C@H]1O[C@H]([C@H](O)[C@@H]1O)N1C=NC2=C(O)N=CN=C12",
+    "molecular_formula": "C10H12N4O5",
+    "n_carbons": 10,
+    "dbe": 7.0,
+    "quat_frac": 0.3,
+    "close_pairs": 2
+  },
+  {
+    "np_mrd_id": "NP0001241",
+    "smiles": "NC1=NC2=C(N=CN2[C@H]2C[C@H](O)[C@@H](CO)O2)C(=O)N1",
+    "molecular_formula": "C10H13N5O4",
+    "n_carbons": 10,
+    "dbe": 7.0,
+    "quat_frac": 0.4,
+    "close_pairs": 2
+  },
+  {
+    "np_mrd_id": "NP0331089",
+    "smiles": "CC1(C)Oc2ccc(C(=O)O)cc2[C@@H](O)[C@H]1O",
+    "molecular_formula": "C12H14O5",
+    "n_carbons": 12,
+    "dbe": 6.0,
+    "quat_frac": 0.42,
+    "close_pairs": 2
+  },
+  {
+    "np_mrd_id": "NP0000157",
+    "smiles": "O=C(O)CCc1ccc(O)c(O)c1",
+    "molecular_formula": "C9H10O4",
+    "n_carbons": 9,
+    "dbe": 5.0,
+    "quat_frac": 0.44,
+    "close_pairs": 2
+  },
+  {
+    "np_mrd_id": "NP0136931",
+    "smiles": "O[C@H]([C@@H](OC(=O)\\C=C\\C1=CC(O)=C(O)C=C1)C(O)=O)C(O)=O",
+    "molecular_formula": "C13H12O9",
+    "n_carbons": 13,
+    "dbe": 8.0,
+    "quat_frac": 0.46,
+    "close_pairs": 2
+  },
+  {
+    "np_mrd_id": "NP0000179",
+    "smiles": "Oc1cc(O)c2c(c1)O[C@H](c1ccc(O)c(O)c1)[C@@H](O)C2",
+    "molecular_formula": "C15H14O6",
+    "n_carbons": 15,
+    "dbe": 9.0,
+    "quat_frac": 0.47,
+    "close_pairs": 2
+  },
+  {
+    "np_mrd_id": "NP0000562",
+    "smiles": "Oc1cc(O)c2c(c1)O[C@H](c1ccc(O)c(O)c1)[C@H](O)C2",
+    "molecular_formula": "C15H14O6",
+    "n_carbons": 15,
+    "dbe": 9.0,
+    "quat_frac": 0.47,
+    "close_pairs": 2
+  },
+  {
+    "np_mrd_id": "NP0044227",
+    "smiles": "NC(Cc1ccccc1)C(=O)O",
+    "molecular_formula": "C9H11NO2",
+    "n_carbons": 9,
+    "dbe": 5.0,
+    "quat_frac": 0.22,
+    "close_pairs": 3
+  },
+  {
+    "np_mrd_id": "NP0000651",
+    "smiles": "O=C(O)Cc1ccccc1",
+    "molecular_formula": "C8H8O2",
+    "n_carbons": 8,
+    "dbe": 5.0,
+    "quat_frac": 0.25,
+    "close_pairs": 3
+  }
+]

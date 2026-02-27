@@ -130,6 +130,42 @@ def _match_c(c_obs: float, c_nodes: list,
 # Stage 1: HSQC → labeled atom inventory
 # ---------------------------------------------------------------------------
 
+def _build_nodes_from_c13(c13_list: list) -> list:
+    """
+    Build atom-node dicts directly from a 1D 13C spectrum list.
+
+    c13_list: [{"c_ppm": float, "n_h": int, "h_ppm": float|None}, ...]
+    One entry per distinct carbon atom — NP-MRD assignment tables already
+    separate each C, so no expansion logic is needed.
+
+    Returns nodes sorted by c_ppm descending with 1-based lsd_id assigned.
+    """
+    nodes: list[dict] = []
+    for entry in c13_list:
+        c_ppm = entry['c_ppm']
+        n_h   = entry.get('n_h', 0)
+        h_ppm = entry.get('h_ppm')
+        # Use 5.5 ppm threshold (not 6.0) to catch flavonoid A-ring CH at
+        # 94–99 ppm / 5.7–6.1 ppm (e.g. catechin C-6, C-8).
+        is_aromatic = (h_ppm is not None and h_ppm > 5.5 and c_ppm > 80.0)
+        hyb = 2 if (c_ppm > 100.0 or is_aromatic) else 3
+        nodes.append({
+            'symbol':      'C',
+            'hyb':         hyb,
+            'n_h':         n_h,
+            'c_ppm':       c_ppm,
+            'h_ppm':       h_ppm if n_h > 0 else None,
+            'is_quat':     (n_h == 0),
+            'is_aromatic': is_aromatic,
+            'group_c_ppm': c_ppm,
+            'group_h_ppm': h_ppm if n_h > 0 else None,
+        })
+    nodes.sort(key=lambda n: n['c_ppm'], reverse=True)
+    for i, node in enumerate(nodes):
+        node['lsd_id'] = i + 1
+    return nodes
+
+
 def extract_atom_nodes(problem: dict) -> list:
     """
     Build a list of LSD atom-node dicts from HSQC peaks plus quaternary
@@ -151,6 +187,13 @@ def extract_atom_nodes(problem: dict) -> list:
     (each with n_h=1) because LSD treats each MULT entry as a distinct atom.
     sp2 CH2 (=CH2, n_h=2) is kept as a single atom.
     """
+    # Fast path: if a 1D 13C spectrum is provided, use it directly.
+    # This bypasses HMBC-based quaternary C detection and formula completion,
+    # giving exact atom counts and shifts directly from experimental data.
+    c13_list = (problem.get('spectra') or {}).get('c13') or []
+    if c13_list:
+        return _build_nodes_from_c13(c13_list)
+
     hsqc = problem['spectra']['hsqc'] or []
     hmbc = problem['spectra'].get('hmbc') or []
     hsqc_c_ppms = [p['c_ppm'] for p in hsqc]
@@ -163,9 +206,10 @@ def extract_atom_nodes(problem: dict) -> list:
         h_ppm = peak['h_ppm']
         n_h   = peak['n_h']
 
-        # Aromatic: h_ppm > 6.0 catches low-ppm aromatics (e.g. quercetin C-6/C-8
-        # at 94–99 ppm) that would be missed by the c_ppm > 100 rule alone.
-        is_aromatic = (h_ppm is not None and h_ppm > 6.0 and c_ppm > 80.0)
+        # Aromatic: h_ppm > 5.5 catches low-ppm aromatics (e.g. quercetin/catechin
+        # C-6/C-8 at 94–99 ppm with H at 5.7–6.2 ppm) that would be missed by the
+        # c_ppm > 100 rule alone.
+        is_aromatic = (h_ppm is not None and h_ppm > 5.5 and c_ppm > 80.0)
         hyb = 2 if (c_ppm > 100.0 or is_aromatic) else 3
 
         # Max H atoms allowed on a single carbon of this type:
@@ -413,15 +457,15 @@ def detect_fragments(atom_nodes: list, molecular_formula: str) -> dict:
     has_aromatic = any(n.get('is_aromatic') for n in atom_nodes)
 
     # Quaternary C candidates for sp2 =O (carbonyl) placement:
-    # Use c_ppm > 175 to catch ketones (~190-215), aldehydes (~195-205),
-    # and esters (~165-185), while excluding aryl-ether C (~145-165) which
-    # has a sigma C-O bond (sp3 O), NOT a carbonyl double bond.
-    # Also include sp2 CH with c_ppm > 175 to catch aldehyde C (CHO group:
+    # Use c_ppm > 163 to catch ketones (~190-215), aldehydes (~195-205),
+    # esters/lactones (~163-185), while excluding aryl-ether C (~145-162)
+    # which has a sigma C-O bond (sp3 O), NOT a carbonyl double bond.
+    # Also include sp2 CH with c_ppm > 163 to catch aldehyde C (CHO group:
     # n_h=1, c_ppm ~190-200 ppm) which is NOT quaternary (it has one H) but
     # still requires a sp2 =O partner.
     carbonyl_nodes = sorted(
         [n for n in atom_nodes
-         if n['hyb'] == 2 and n['c_ppm'] > 175.0
+         if n['hyb'] == 2 and n['c_ppm'] > 163.0
          and (n['is_quat'] or n.get('n_h', 0) == 1)],
         key=lambda n: n['c_ppm'], reverse=True,
     )

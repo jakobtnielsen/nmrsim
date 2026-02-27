@@ -45,10 +45,11 @@ from score_answer import tanimoto_similarity
 # Paths
 # ---------------------------------------------------------------------------
 
-_DIR         = os.path.dirname(os.path.abspath(__file__))
-TESTSET_PATH = os.path.join(_DIR, "data", "npmrd_testset.json")
-ZIP_PATH     = os.path.join(_DIR, "data", "assignment_tables.zip")
-OUTPUT_DIR   = os.path.join(_DIR, "outputs")
+_DIR            = os.path.dirname(os.path.abspath(__file__))
+TESTSET_PATH    = os.path.join(_DIR, "data", "npmrd_testset.json")
+V2_TESTSET_PATH = os.path.join(_DIR, "data", "npmrd_v2_testset.json")
+ZIP_PATH        = os.path.join(_DIR, "data", "assignment_tables.zip")
+OUTPUT_DIR      = os.path.join(_DIR, "outputs")
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +143,67 @@ def parse_chsqc_table(content: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# CHSQC-derived shift fallbacks (for assign tables missing H or C entries)
+# ---------------------------------------------------------------------------
+
+def _c_shifts_from_chsqc(chsqc_content: str) -> dict:
+    """
+    Build {rdkit_c_idx: c_ppm} from CHSQC table.
+    c_rdkit = c_npmrd_num - 1 (1-based → 0-based).
+    Used when the regular assign table has no C entries.
+    """
+    c_shifts: dict = {}
+    for line in chsqc_content.strip().splitlines():
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            c_num = int(parts[3].strip())
+            c_ppm = float(parts[5].strip())
+        except (ValueError, IndexError):
+            continue
+        c_rdkit = c_num - 1
+        c_shifts[c_rdkit] = round(c_ppm, 4)
+    return c_shifts
+
+
+def _h_shifts_from_chsqc(mol_h, chsqc_content: str) -> dict:
+    """
+    Build {rdkit_h_idx: h_ppm} from CHSQC table, mapping via C neighbours.
+
+    For each CHSQC entry (c_num, h_ppm): find H atoms attached to c_rdkit
+    in mol_h and assign h_ppm to each.  For CH2/CH3 groups all H get the
+    same shift (mean of CHSQC entries for that C).
+    """
+    c_to_h_ppms: dict = defaultdict(list)
+    for line in chsqc_content.strip().splitlines():
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            c_num = int(parts[3].strip())
+            h_ppm = float(parts[4].strip())
+        except (ValueError, IndexError):
+            continue
+        c_to_h_ppms[c_num].append(round(h_ppm, 4))
+
+    h_shifts: dict = {}
+    for atom in mol_h.GetAtoms():
+        if atom.GetAtomicNum() != 6:
+            continue
+        c_rdkit = atom.GetIdx()
+        c_num   = c_rdkit + 1
+        ppms    = c_to_h_ppms.get(c_num)
+        if not ppms:
+            continue
+        mean_ppm = round(sum(ppms) / len(ppms), 4)
+        for nbr in atom.GetNeighbors():
+            if nbr.GetAtomicNum() == 1:
+                h_shifts[nbr.GetIdx()] = mean_ppm
+    return h_shifts
+
+
+# ---------------------------------------------------------------------------
 # Building HMBC and COSY from experimental shifts + RDKit topology
 # ---------------------------------------------------------------------------
 
@@ -221,6 +283,59 @@ def build_cosy_exp(mol_h, h_shifts: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# 1D 13C spectrum from experimental assignments
+# ---------------------------------------------------------------------------
+
+def build_c13_spectrum(chsqc_content: str, assign_content: str) -> list:
+    """
+    Build a 1D 13C spectrum list from CHSQC + regular assignment tables.
+
+    Returns [{"c_ppm": float, "n_h": int, "h_ppm": float|None}, ...]
+    One entry per carbon atom (keyed by atom number from assign table).
+    n_h  = number of H entries in CHSQC table pointing to this C.
+    h_ppm = mean of CHSQC H shifts for this C (None if n_h == 0).
+    """
+    # Build c_num → [h_ppm, ...] from CHSQC table (format: H,h#,C,c#,h_ppm,c_ppm)
+    c_to_h_ppms: dict = defaultdict(list)
+    for line in chsqc_content.strip().splitlines():
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            c_num = int(parts[3].strip())
+            h_ppm = float(parts[4].strip())
+        except (ValueError, IndexError):
+            continue
+        c_to_h_ppms[c_num].append(round(h_ppm, 4))
+
+    c13_list = []
+    for line in assign_content.strip().splitlines():
+        parts = line.split(",", 4)
+        if len(parts) < 3:
+            continue
+        atom_type = parts[0].strip().upper()
+        if atom_type != 'C':
+            continue
+        shift_str = parts[2].strip()
+        if not shift_str or shift_str.upper() in ('NA', 'N/A'):
+            continue
+        try:
+            c_num = int(parts[1].strip())
+            c_ppm = float(shift_str)
+        except ValueError:
+            continue
+        hs = c_to_h_ppms.get(c_num, [])
+        n_h = len(hs)
+        h_ppm = round(sum(hs) / len(hs), 4) if hs else None
+        c13_list.append({
+            "c_ppm": round(c_ppm, 4),
+            "n_h":   n_h,
+            "h_ppm": h_ppm,
+        })
+    return c13_list
+
+
+# ---------------------------------------------------------------------------
 # Per-compound pipeline
 # ---------------------------------------------------------------------------
 
@@ -259,9 +374,21 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
         h_shifts_exp, c_shifts_exp = parse_assign_table(assign_content)
         hsqc_peaks = parse_chsqc_table(chsqc_content)
 
+        # --- Build 1D 13C spectrum (includes quaternary C) ---
+        c13 = build_c13_spectrum(chsqc_content, assign_content)
+
+        # --- Supplement missing shifts from CHSQC when assign table is partial ---
+        # Some assign tables have only H entries (no C) or only C entries (no H).
+        # CHSQC provides reliable fallback values for both, keyed by atom index.
+        c_shifts_chsqc = _c_shifts_from_chsqc(chsqc_content)
+        h_shifts_chsqc = _h_shifts_from_chsqc(mol_h, chsqc_content)
+        # Merge: experimental assign table overrides CHSQC for overlapping atoms
+        c_shifts_merged = {**c_shifts_chsqc, **c_shifts_exp}
+        h_shifts_merged = {**h_shifts_chsqc, **h_shifts_exp}
+
         # --- Build semi-simulated HMBC and COSY ---
-        hmbc_raw = build_hmbc_exp(mol_h, h_shifts_exp, c_shifts_exp)
-        cosy_raw = build_cosy_exp(mol_h, h_shifts_exp)
+        hmbc_raw = build_hmbc_exp(mol_h, h_shifts_merged, c_shifts_merged)
+        cosy_raw = build_cosy_exp(mol_h, h_shifts_merged)
 
         # Collapse (standard tolerances)
         hmbc = collapse_2d_peaks(hmbc_raw, "hmbc")
@@ -279,6 +406,7 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
                 "hsqc": hsqc_for_lsd,
                 "hmbc": hmbc,
                 "cosy": cosy,
+                "c13":  c13,   # 1D 13C enables direct atom node building
             },
         }
 
@@ -289,12 +417,18 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
         smiles_list, lsd_text = run_lsd(atom_nodes, constraints, fragments, formula)
         lsd_count = len(smiles_list)
 
+        base_fields = {
+            "formula":    formula,
+            "n_hsqc":     len(hsqc_peaks),
+            "n_c13":      len(c13),
+            "n_hmbc":     len(hmbc),
+            "n_cosy":     len(cosy),
+            "h_assigned": len(h_shifts_exp),
+            "c_assigned": len(c_shifts_exp),
+        }
+
         if lsd_count == 0:
-            return {**result_base, "formula": formula,
-                    "n_hsqc": len(hsqc_peaks),
-                    "n_hmbc": len(hmbc), "n_cosy": len(cosy),
-                    "h_assigned": len(h_shifts_exp),
-                    "c_assigned": len(c_shifts_exp),
+            return {**result_base, **base_fields,
                     "lsd_count": 0, "gt_rank": None, "gt_tanimoto": None,
                     "candidates": []}
 
@@ -318,17 +452,12 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
 
         return {
             **result_base,
-            "formula":      formula,
-            "n_hsqc":       len(hsqc_peaks),
-            "n_hmbc":       len(hmbc),
-            "n_cosy":       len(cosy),
-            "h_assigned":   len(h_shifts_exp),
-            "c_assigned":   len(c_shifts_exp),
-            "lsd_count":    lsd_count,
-            "gt_rank":      gt_rank,
-            "gt_tanimoto":  round(gt_tanimoto, 4) if gt_tanimoto else None,
-            "candidates":   candidates[:10],  # top 10 for JSON output
-            "lsd_text":     lsd_text,
+            **base_fields,
+            "lsd_count":   lsd_count,
+            "gt_rank":     gt_rank,
+            "gt_tanimoto": round(gt_tanimoto, 4) if gt_tanimoto else None,
+            "candidates":  candidates[:10],  # top 10 for JSON output
+            "lsd_text":    lsd_text,
         }
 
     except Exception as exc:
@@ -343,11 +472,12 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
 def run_benchmark(testset_path: str = TESTSET_PATH,
                   zip_path: str = ZIP_PATH,
                   output_dir: str = OUTPUT_DIR,
-                  max_candidates: int = 50) -> None:
+                  max_candidates: int = 50,
+                  output_prefix: str = "hybrid_benchmark") -> None:
 
     os.makedirs(output_dir, exist_ok=True)
-    csv_path  = os.path.join(output_dir, "hybrid_benchmark.csv")
-    json_path = os.path.join(output_dir, "hybrid_benchmark.json")
+    csv_path  = os.path.join(output_dir, f"{output_prefix}.csv")
+    json_path = os.path.join(output_dir, f"{output_prefix}.json")
 
     with open(testset_path) as f:
         testset = json.load(f)
@@ -378,8 +508,9 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
             else:
                 rank_str = (f"rank={r['gt_rank']}" if r["gt_rank"]
                             else f"tanimoto={r['gt_tanimoto']}")
+                c13_str = f", C13={r.get('n_c13', '-')}" if r.get('n_c13') else ""
                 print(f"LSD={r['lsd_count']} solutions, GT {rank_str}  "
-                      f"[HSQC={r['n_hsqc']}, HMBC={r['n_hmbc']}, COSY={r['n_cosy']}]")
+                      f"[HSQC={r['n_hsqc']}{c13_str}, HMBC={r['n_hmbc']}, COSY={r['n_cosy']}]")
 
     # --- Summary ---
     n_ok       = sum(1 for r in results if not r.get("error"))
@@ -414,7 +545,7 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
     # --- Save CSV ---
     csv_fields = [
         "np_mrd_id", "smiles", "formula",
-        "n_hsqc", "n_hmbc", "n_cosy",
+        "n_hsqc", "n_c13", "n_hmbc", "n_cosy",
         "h_assigned", "c_assigned",
         "lsd_count", "gt_rank", "gt_tanimoto", "error",
     ]
@@ -441,12 +572,23 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
 def _cli() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--testset",        default=TESTSET_PATH)
+    p.add_argument("--testset",        default=None,
+                   help="Path to testset JSON (default: npmrd_testset.json)")
+    p.add_argument("--v2",             action="store_true",
+                   help="Use v2 testset (npmrd_v2_testset.json) with 1D 13C support")
     p.add_argument("--zip",            default=ZIP_PATH)
     p.add_argument("--output-dir",     default=OUTPUT_DIR)
     p.add_argument("--max-candidates", type=int, default=50)
     args = p.parse_args()
-    run_benchmark(args.testset, args.zip, args.output_dir, args.max_candidates)
+
+    if args.v2:
+        testset = args.testset or V2_TESTSET_PATH
+        prefix  = "hybrid_v2_benchmark"
+    else:
+        testset = args.testset or TESTSET_PATH
+        prefix  = "hybrid_benchmark"
+
+    run_benchmark(testset, args.zip, args.output_dir, args.max_candidates, prefix)
 
 
 if __name__ == "__main__":
