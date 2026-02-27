@@ -1,0 +1,3 @@
+# Downloaded bulk files — re-creatable by fetch_npmrd.py
+*.csv.gz
+assignment_tables.zip

@@ -80,21 +80,40 @@ class TestCollapseHMBC:
 
 class TestCollapseCOSY:
     def test_cosy_merged_within_tolerance(self):
+        # Two peaks within tolerance: (7.30,7.50) and (7.31,7.51).
+        # After normalization (both already h1<h2), they cluster into one.
+        # The symmetric counterpart (7.505,7.305) is also emitted → 2 peaks total.
         peaks = [
             {"h1_ppm": 7.30, "h2_ppm": 7.50},
             {"h1_ppm": 7.31, "h2_ppm": 7.51},  # Δh1=0.01, Δh2=0.01
         ]
         out = collapse_2d_peaks(peaks, "cosy", tol_h=0.02, tol_h2=0.02)
-        assert len(out) == 1
-        assert abs(out[0]["h1_ppm"] - 7.305) < 0.001
+        assert len(out) == 2
+        # One peak should have h1 ≈ 7.305
+        h1_vals = sorted(p["h1_ppm"] for p in out)
+        assert abs(h1_vals[0] - 7.305) < 0.001
 
     def test_cosy_not_merged_different_h2(self):
+        # Two non-mergeable peaks; each emits its symmetric counterpart → 4 total.
         peaks = [
             {"h1_ppm": 7.30, "h2_ppm": 7.50},
-            {"h1_ppm": 7.31, "h2_ppm": 8.00},  # h2 differs
+            {"h1_ppm": 7.31, "h2_ppm": 8.00},  # h2 differs too much to merge
         ]
         out = collapse_2d_peaks(peaks, "cosy", tol_h=0.02, tol_h2=0.02)
+        assert len(out) == 4
+
+    def test_cosy_symmetric_input_preserved(self):
+        # Real COSY: symmetric input (a,b) + (b,a) should collapse to 2 peaks.
+        peaks = [
+            {"h1_ppm": 1.24, "h2_ppm": 1.27},
+            {"h1_ppm": 1.27, "h2_ppm": 1.24},
+        ]
+        out = collapse_2d_peaks(peaks, "cosy")
         assert len(out) == 2
+        pairs = {(p["h1_ppm"], p["h2_ppm"]) for p in out}
+        # Both directions must be present
+        assert any(p["h1_ppm"] < p["h2_ppm"] for p in out)
+        assert any(p["h1_ppm"] > p["h2_ppm"] for p in out)
 
     def test_invalid_experiment_raises(self):
         with pytest.raises(ValueError):

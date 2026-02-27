@@ -163,16 +163,34 @@ def extract_atom_nodes(problem: dict) -> list:
         h_ppm = peak['h_ppm']
         n_h   = peak['n_h']
 
-        is_aromatic = (c_ppm > 100.0 and h_ppm is not None and h_ppm > 6.0)
-        hyb = 2 if c_ppm > 100.0 else 3
+        # Aromatic: h_ppm > 6.0 catches low-ppm aromatics (e.g. quercetin C-6/C-8
+        # at 94–99 ppm) that would be missed by the c_ppm > 100 rule alone.
+        is_aromatic = (h_ppm is not None and h_ppm > 6.0 and c_ppm > 80.0)
+        hyb = 2 if (c_ppm > 100.0 or is_aromatic) else 3
 
-        if is_aromatic and n_h > 1:
-            # Expand equivalent aromatic CH into individual atoms
-            for _ in range(n_h):
+        # Max H atoms allowed on a single carbon of this type:
+        #   aromatic CH → 1   (ring C with exactly one H)
+        #   olefinic sp2 → 2  (=CH2 terminal alkene)
+        #   sp3 → 3           (CH3 methyl group)
+        # If n_h exceeds this limit, the HSQC peak represents multiple
+        # equivalent carbons collapsed to one peak; split them.
+        max_nh_single = 1 if is_aromatic else (2 if hyb == 2 else 3)
+
+        if n_h > max_nh_single:
+            # Find largest divisor of n_h that is ≤ max_nh_single
+            n_h_per = max_nh_single
+            while n_h_per >= 1:
+                if n_h % n_h_per == 0:
+                    break
+                n_h_per -= 1
+            if n_h_per == 0:
+                n_h_per = 1
+            n_equiv = n_h // n_h_per
+            for _ in range(n_equiv):
                 nodes.append({
-                    'symbol': 'C', 'hyb': hyb, 'n_h': 1,
+                    'symbol': 'C', 'hyb': hyb, 'n_h': n_h_per,
                     'c_ppm': c_ppm, 'h_ppm': h_ppm,
-                    'is_quat': False, 'is_aromatic': True,
+                    'is_quat': False, 'is_aromatic': is_aromatic,
                     'group_c_ppm': c_ppm, 'group_h_ppm': h_ppm,
                 })
         else:
@@ -203,6 +221,9 @@ def extract_atom_nodes(problem: dict) -> list:
         else:
             clusters[matched_rep].add(c)
 
+    # Number of HSQC-derived C atoms (before adding quat nodes).
+    n_c_hsqc = len(nodes)
+
     for cluster in clusters.values():
         c_ppm = sum(cluster) / len(cluster)
         hyb = 2 if c_ppm > 100.0 else 3
@@ -213,6 +234,40 @@ def extract_atom_nodes(problem: dict) -> list:
             'is_aromatic': (100.0 < c_ppm < 165.0),
             'group_c_ppm': c_ppm, 'group_h_ppm': None,
         })
+
+    # Formula-based quat-C completion: if HMBC-detected quat C < expected
+    # (e.g. two nearly-identical ring C merged by the 0.25-ppm tolerance,
+    # like vanillin C3/C4 both at ~148.5 ppm), add placeholder atoms at the
+    # shift of the most-populated cluster so LSD has the right atom count.
+    mol_formula = problem.get('molecular_formula', '') if isinstance(problem, dict) else ''
+    formula_c = _parse_formula(mol_formula).get('C', 0)
+    n_quat_expected = max(0, formula_c - n_c_hsqc)
+    n_quat_detected = len(clusters)
+    if formula_c > 0 and n_quat_detected < n_quat_expected:
+        deficit = n_quat_expected - n_quat_detected
+        # Only fix the common case of exactly 1 merged cluster (e.g. vanillin
+        # C3/C4 both at ~148.5 ppm merged by 0.25-ppm tolerance).  Larger
+        # deficits (quercetin, caffeine) arise from incomplete HMBC coverage
+        # across many quat-C atoms; adding free-floating atoms in those cases
+        # explodes the LSD search space and causes timeouts.
+        if deficit == 1:
+            sorted_by_count = sorted(
+                [(len(vs), rep) for rep, vs in clusters.items()],
+                reverse=True,
+            )
+            if sorted_by_count:
+                _, rep = sorted_by_count[0]
+                c_ppm = sum(clusters[rep]) / len(clusters[rep])
+            else:
+                c_ppm = 130.0  # fallback aromatic C shift
+            hyb = 2 if c_ppm > 100.0 else 3
+            nodes.append({
+                'symbol': 'C', 'hyb': hyb, 'n_h': 0,
+                'c_ppm': c_ppm, 'h_ppm': None,
+                'is_quat': True,
+                'is_aromatic': (100.0 < c_ppm < 165.0),
+                'group_c_ppm': c_ppm, 'group_h_ppm': None,
+            })
 
     # Sort by c_ppm descending, assign 1-based LSD IDs
     nodes.sort(key=lambda n: n['c_ppm'], reverse=True)
@@ -258,21 +313,25 @@ def extract_constraints(problem: dict, atom_nodes: list) -> dict:
     id_to_node: dict[int, dict] = {n['lsd_id']: n for n in atom_nodes}
 
     # --- HMBC ---
+    # Apply each HMBC peak to ALL atoms in the matching H-group (not just the
+    # representative).  For equivalent aromatic CH groups (e.g. the two ortho
+    # CH atoms in a para-disubstituted benzene), every member must be
+    # constrained identically; using only the representative leaves its
+    # partner unconstrained and explodes the LSD solution count.
     hmbc_set: set[tuple] = set()
     for peak in hmbc_peaks:
         h_ids = _match_h(peak['h_ppm'], h_index)
         if not h_ids:
             continue
-        # One representative H atom per NMR peak (lowest lsd_id)
-        h_id = sorted(h_ids)[0]
-        h_node = id_to_node.get(h_id)
-        if h_node is None:
-            continue
-        gc = h_node.get('group_c_ppm')
-        same_group = group_c_to_ids.get(gc, {h_id}) if gc is not None else {h_id}
-        c_id = _match_c(peak['c_ppm'], c_nodes, exclude_ids=same_group)
-        if c_id is not None and c_id not in same_group:
-            hmbc_set.add((h_id, c_id))
+        for h_id in sorted(h_ids):
+            h_node = id_to_node.get(h_id)
+            if h_node is None:
+                continue
+            gc = h_node.get('group_c_ppm')
+            same_group = group_c_to_ids.get(gc, {h_id}) if gc is not None else {h_id}
+            c_id = _match_c(peak['c_ppm'], c_nodes, exclude_ids=same_group)
+            if c_id is not None and c_id not in same_group:
+                hmbc_set.add((h_id, c_id))
 
     # --- COSY ---
     cosy_set: set[tuple] = set()
@@ -283,6 +342,21 @@ def extract_constraints(problem: dict, atom_nodes: list) -> dict:
             continue
         sa = sorted(a_ids)
         sb = sorted(b_ids)
+
+        # Skip COSY if either side is a multi-atom non-aromatic group.
+        # Such groups arise from equivalent sp3 CH2/CH3 carbons collapsed
+        # into one HSQC peak (e.g. two isopropyl CH3 at the same shift →
+        # n_h=6 → split into 2 atoms).  Assigning the same COSY partner to
+        # ALL atoms in the group would over-constrain each CH2/CH3 atom and
+        # trigger LSD error 283 ("max number of neighbors exceeded").
+        # Aromatic multi-atom groups (ortho pairs etc.) are fine: each atom
+        # genuinely bonds to the same neighbouring aromatic CH.
+        def _is_multi_nonaromatic(ids: list) -> bool:
+            return len(ids) > 1 and not all(id_to_node[i]['is_aromatic'] for i in ids)
+
+        if _is_multi_nonaromatic(sa) or _is_multi_nonaromatic(sb):
+            continue
+
         longer, shorter = (sa, sb) if len(sa) >= len(sb) else (sb, sa)
         shorter_cyc = list(islice(cycle(shorter), len(longer)))
         for a, b in zip(longer, shorter_cyc):
@@ -342,8 +416,13 @@ def detect_fragments(atom_nodes: list, molecular_formula: str) -> dict:
     # Use c_ppm > 175 to catch ketones (~190-215), aldehydes (~195-205),
     # and esters (~165-185), while excluding aryl-ether C (~145-165) which
     # has a sigma C-O bond (sp3 O), NOT a carbonyl double bond.
+    # Also include sp2 CH with c_ppm > 175 to catch aldehyde C (CHO group:
+    # n_h=1, c_ppm ~190-200 ppm) which is NOT quaternary (it has one H) but
+    # still requires a sp2 =O partner.
     carbonyl_nodes = sorted(
-        [n for n in atom_nodes if n['is_quat'] and n['c_ppm'] > 175.0],
+        [n for n in atom_nodes
+         if n['hyb'] == 2 and n['c_ppm'] > 175.0
+         and (n['is_quat'] or n.get('n_h', 0) == 1)],
         key=lambda n: n['c_ppm'], reverse=True,
     )
 
@@ -362,29 +441,41 @@ def detect_fragments(atom_nodes: list, molecular_formula: str) -> dict:
         next_id += 1
         assigned_o += 1
 
-    for _ in range(n_o - assigned_o):
-        o_h = 1 if remaining_h > 0 else 0
-        if o_h:
+    # --- Nitrogen (assigned before remaining O) ---
+    # N is assigned BEFORE remaining O so that amine H are reserved for N.
+    # For p-nitroaniline (C6H6N2O2): remaining_h=2 after aromatic C, so
+    # N1 (amino N) correctly gets sp3 n_h=2 and remaining_h→0, leaving
+    # the nitro N (N2) to be sp2 n_h=0 and both O atoms with no H.
+    for _ in range(n_n):
+        if remaining_h >= 2:
+            # Primary amine: NH2 (aniline, p-nitroaniline, PABA, etc.)
+            hyb_n, n_h_n = 3, 2
+            remaining_h -= 2
+        elif remaining_h == 1:
+            # Secondary amine: NH (indole, pyrrole, etc.)
+            hyb_n, n_h_n = 3, 1
             remaining_h -= 1
+        elif has_aromatic:
+            # No H left: sp2 N (pyridine, nitro, imide, isoquinoline, etc.)
+            hyb_n, n_h_n = 2, 0
+        else:
+            # Non-aromatic, no H (tertiary amine, quaternary N, etc.)
+            hyb_n, n_h_n = 3, 0
         extra_atoms.append({
-            'lsd_id': next_id, 'symbol': 'O', 'hyb': 3, 'n_h': o_h,
+            'lsd_id': next_id, 'symbol': 'N', 'hyb': hyb_n, 'n_h': n_h_n,
             'c_ppm': None, 'h_ppm': None,
             'is_quat': False, 'is_aromatic': False,
             'group_c_ppm': None, 'group_h_ppm': None,
         })
         next_id += 1
 
-    # --- Nitrogen ---
-    for _ in range(n_n):
-        if has_aromatic:
-            hyb_n, n_h_n = 2, 0       # aromatic / amide N
-        else:
-            n_h_n = 1 if remaining_h > 0 else 0
-            if n_h_n:
-                remaining_h -= 1
-            hyb_n = 3
+    # --- Remaining Oxygen (after N has taken its H) ---
+    for _ in range(n_o - assigned_o):
+        o_h = 1 if remaining_h > 0 else 0
+        if o_h:
+            remaining_h -= 1
         extra_atoms.append({
-            'lsd_id': next_id, 'symbol': 'N', 'hyb': hyb_n, 'n_h': n_h_n,
+            'lsd_id': next_id, 'symbol': 'O', 'hyb': 3, 'n_h': o_h,
             'c_ppm': None, 'h_ppm': None,
             'is_quat': False, 'is_aromatic': False,
             'group_c_ppm': None, 'group_h_ppm': None,
@@ -403,6 +494,101 @@ def detect_fragments(atom_nodes: list, molecular_formula: str) -> dict:
             'group_c_ppm': None, 'group_h_ppm': None,
         })
         next_id += 1
+
+    # -------------------------------------------------------------------
+    # Post-processing: ensure even sp2 count and correct H balance.
+    #
+    # LSD requires:
+    #   (a) total sp2 atom count is even (each π-bond pairs two sp2 atoms)
+    #   (b) total valence = 2 × bonds = even (sum of element valences + H counts)
+    #
+    # Two common failures:
+    #   • Ester/lactone/COOH C=O at 155–175 ppm: our carbonyl threshold (>175)
+    #     misses these, leaving sp2 C without a sp2 O partner → odd sp2 count.
+    #   • Pyrrole/amine N assigned sp2(n_h=0) instead of sp3 with its H atoms
+    #     → H deficit in the molecule → odd total valence.
+    # -------------------------------------------------------------------
+    all_atoms = atom_nodes + extra_atoms
+    n_h_formula = formula.get('H', 0)
+    h_on_atoms  = sum(a['n_h'] for a in all_atoms)
+    sp2_count   = sum(1 for a in all_atoms if a['hyb'] == 2)
+
+    # Step 1 — H balance: if atoms have fewer H than the formula requires,
+    # convert sp2 N (n_h=0) atoms to sp3 and give them the missing H.
+    # This fixes pyrrole-type N and primary/secondary aromatic amines.
+    h_needed = n_h_formula - h_on_atoms
+    if h_needed > 0:
+        for ea in extra_atoms:
+            if h_needed <= 0:
+                break
+            if ea['symbol'] == 'N' and ea['hyb'] == 2 and ea['n_h'] == 0:
+                give = min(h_needed, 2)   # at most 2 H per N (primary amine)
+                ea['n_h'] = give
+                ea['hyb'] = 3             # sp3: N has H, no formal C=N double bond
+                h_on_atoms += give
+                h_needed   -= give
+                sp2_count  -= 1
+
+    # Step 2 — sp2 parity: if sp2 count is odd, find the highest-ppm
+    # unassigned quat sp2 C (likely an ester/lactone/COOH carbonyl at
+    # 150–175 ppm) and upgrade one sp3 O to sp2 O with a BOND constraint.
+    if sp2_count % 2 == 1:
+        bonded_ids = (
+            {id1 for id1, id2 in bond_constraints}
+            | {id2 for id1, id2 in bond_constraints}
+        )
+        candidate_cs = sorted(
+            [n for n in atom_nodes
+             if n['symbol'] == 'C' and n['is_quat'] and n['hyb'] == 2
+             and n['c_ppm'] > 150.0 and n['lsd_id'] not in bonded_ids],
+            key=lambda n: n['c_ppm'], reverse=True,
+        )
+        # Sort sp3 O atoms: prefer n_h=0 (ether O) over n_h=1 (OH)
+        # to avoid unnecessarily removing a hydroxyl proton.
+        sp3_os = sorted(
+            [ea for ea in extra_atoms
+             if ea['symbol'] == 'O' and ea['hyb'] == 3],
+            key=lambda a: a['n_h'],
+        )
+        if candidate_cs and sp3_os:
+            # C=O pairing: BOND highest-ppm eligible C to a sp3 O.
+            cn = candidate_cs[0]
+            oa = sp3_os[0]
+            freed_h = oa['n_h']
+            oa['hyb'] = 2
+            oa['n_h'] = 0
+            bond_constraints.append((cn['lsd_id'], oa['lsd_id']))
+            sp2_count += 1
+            # Redistribute any freed H to sp3 N that could use more
+            # (e.g. amino N that only got 1 H in Step 1 but needs 2).
+            if freed_h > 0:
+                for ea in extra_atoms:
+                    if freed_h == 0:
+                        break
+                    if ea['symbol'] == 'N' and ea['hyb'] == 3:
+                        ea['n_h'] += freed_h
+                        freed_h = 0
+        elif sp3_os:
+            # Fallback N=O pairing: no eligible high-ppm C (e.g. nitro group
+            # where ring C is below 150 ppm).  Bond a sp2 N (n_h=0) to a
+            # sp3 O to form the first N=O of the nitro/nitroso group.
+            sp2_ns = [ea for ea in extra_atoms
+                      if ea['symbol'] == 'N' and ea['hyb'] == 2 and ea['n_h'] == 0]
+            if sp2_ns:
+                na = sp2_ns[0]
+                oa = sp3_os[0]
+                freed_h = oa['n_h']
+                oa['hyb'] = 2
+                oa['n_h'] = 0
+                bond_constraints.append((na['lsd_id'], oa['lsd_id']))
+                sp2_count += 1
+                if freed_h > 0:
+                    for ea in extra_atoms:
+                        if freed_h == 0:
+                            break
+                        if ea['symbol'] == 'N' and ea['hyb'] == 3:
+                            ea['n_h'] += freed_h
+                            freed_h = 0
 
     return {
         'extra_atoms': extra_atoms,
@@ -537,12 +723,22 @@ def rank_candidates(smiles_list: list, atom_nodes: list,
     obs = sorted({n['c_ppm'] for n in atom_nodes if n['symbol'] == 'C'})
 
     results: list[dict] = []
+    _consecutive_failures = 0
+    _network_ok = True
     for smiles in smiles_list:
+        if not _network_ok:
+            # Network is down — skip remaining HTTP calls rather than timing out.
+            results.append({'smiles': smiles, 'score': None, 'rank': 0})
+            continue
         try:
             pred_data = predict_shifts(smiles, backend='nmrshiftdb')
             pred = sorted(set(pred_data['c_shifts'].values()))
+            _consecutive_failures = 0
         except BackendError:
-            results.append({'smiles': smiles, 'score': float('inf'), 'rank': 0})
+            _consecutive_failures += 1
+            if _consecutive_failures >= 3:
+                _network_ok = False
+            results.append({'smiles': smiles, 'score': None, 'rank': 0})
             continue
 
         if not obs or not pred:
@@ -554,7 +750,7 @@ def rank_candidates(smiles_list: list, atom_nodes: list,
         mae = float(cost[ri, ci].mean())
         results.append({'smiles': smiles, 'score': mae, 'rank': 0})
 
-    results.sort(key=lambda x: x['score'])
+    results.sort(key=lambda x: (x['score'] is None, x['score'] or 0.0))
     for i, r in enumerate(results):
         r['rank'] = i + 1
     return results

@@ -177,9 +177,9 @@ def generate_problem(
     shift_result = predict_shifts(canonical_smiles, backend=backend)
 
     # 4. Build 2D peaks
-    hsqc_raw = build_hsqc(shift_result)
-    hmbc_raw = build_hmbc(shift_result)
-    cosy_raw = build_cosy(shift_result)
+    hsqc_raw = build_hsqc(shift_result, random_seed=random_seed)
+    hmbc_raw = build_hmbc(shift_result, random_seed=random_seed)
+    cosy_raw = build_cosy(shift_result, random_seed=random_seed)
 
     # 5. Collapse peaks
     if collapse:

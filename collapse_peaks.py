@@ -101,12 +101,19 @@ def _collapse_hc(peaks: list, experiment: str,
 
 
 def _collapse_hh(peaks: list, tol_h: float, tol_h2: float) -> list:
-    """Greedy clustering for H–H experiment (COSY)."""
+    """
+    Greedy clustering for H–H experiment (COSY).
+
+    Normalise each peak so h1 ≤ h2 before clustering (symmetric pairs are
+    identical in normalised form). After clustering, re-emit both (h1, h2) and
+    (h2, h1) for off-diagonal peaks, preserving COSY symmetry.
+    """
     clusters = []
 
     for peak in peaks:
-        h1 = peak["h1_ppm"]
-        h2 = peak["h2_ppm"]
+        # Normalise: always store the smaller shift first
+        a, b = peak["h1_ppm"], peak["h2_ppm"]
+        h1, h2 = (a, b) if a <= b else (b, a)
 
         merged = False
         for cl in clusters:
@@ -125,9 +132,10 @@ def _collapse_hh(peaks: list, tol_h: float, tol_h2: float) -> list:
     result = []
     for cl in clusters:
         n = cl["n"]
-        result.append({
-            "h1_ppm": round(cl["h1_sum"] / n, 4),
-            "h2_ppm": round(cl["h2_sum"] / n, 4),
-        })
+        h1 = round(cl["h1_sum"] / n, 4)
+        h2 = round(cl["h2_sum"] / n, 4)
+        result.append({"h1_ppm": h1, "h2_ppm": h2})
+        if h1 != h2:
+            result.append({"h1_ppm": h2, "h2_ppm": h1})
 
     return sorted(result, key=lambda p: (p["h1_ppm"], p["h2_ppm"]))

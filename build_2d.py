@@ -4,11 +4,17 @@ build_2d.py — Stage 2: HSQC / HMBC / COSY peak lists from shift predictions.
 All logic follows NMR_SKILL.md Sections 1–3.
 """
 
+import random as _random
 from collections import defaultdict
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdmolops, AllChem
+
+# Standard deviation (ppm) for the per-proton diastereotopic split offset.
+# Each proton in a diastereotopic pair gets ±|N(0, σ)|, so the total H–H
+# separation is ~2× this value on average.
+_DIAST_SIGMA = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +42,102 @@ def _get_equivalent_h_groups(mol_with_hs) -> dict:
     return dict(groups)
 
 
+def _get_diastereotopic_ch2_pairs(mol_with_hs) -> set:
+    """
+    Return set of frozenset({h1_idx, h2_idx}) for diastereotopic CH₂ groups.
+
+    A pair is diastereotopic when:
+    - Both H atoms sit on the same carbon (CH₂ — exactly 2 H neighbors)
+    - They share the same canonical rank without chirality (currently treated
+      as equivalent homotopic protons)
+    - But get different ranks when chirality is included (i.e., they are
+      distinguishable due to a nearby stereocenter or prochiral centre)
+    """
+    ranks_nochir = list(Chem.CanonicalRankAtoms(mol_with_hs, breakTies=False))
+    ranks_chiral = list(Chem.CanonicalRankAtoms(
+        mol_with_hs, breakTies=False, includeChirality=True))
+    pairs: set = set()
+    for c_atom in mol_with_hs.GetAtoms():
+        if c_atom.GetAtomicNum() != 6:
+            continue
+        h_nbrs = [n.GetIdx() for n in c_atom.GetNeighbors()
+                  if n.GetAtomicNum() == 1]
+        if len(h_nbrs) != 2:
+            continue
+        h1, h2 = h_nbrs
+        # Already in separate groups without chirality → not our concern
+        if ranks_nochir[h1] != ranks_nochir[h2]:
+            continue
+        # Different ranks with chirality → diastereotopic
+        if ranks_chiral[h1] != ranks_chiral[h2]:
+            pairs.add(frozenset({h1, h2}))
+    return pairs
+
+
+def apply_diastereotopic_splits(shift_result: dict,
+                                random_seed: int = 42) -> dict:
+    """
+    Return a modified shift_result with diastereotopic CH₂ protons split.
+
+    For each diastereotopic pair (h1, h2) the two protons receive offsets
+    +δ and −δ (where δ ~ |N(0, _DIAST_SIGMA)|), so every downstream spectrum
+    (HSQC, HMBC, COSY) sees the same individual H shifts.
+
+    The modified dict contains:
+    - 'h_shifts': updated per-atom H shifts
+    - '_split_atoms': set of atom indices that received individual offsets
+      (used by build functions to place them in singleton H groups)
+
+    Pairs are processed in deterministic order (sorted by min(h1, h2)) so
+    the same seed always produces the same split for a given molecule.
+    """
+    mol = shift_result["mol_with_hs"]
+    h_shifts = shift_result["h_shifts"]
+
+    diast_pairs = _get_diastereotopic_ch2_pairs(mol)
+    rng = _random.Random(random_seed)
+
+    h_shifts_eff = dict(h_shifts)
+    split_atoms: set = set()
+
+    for pair in sorted(diast_pairs, key=lambda p: min(p)):
+        h1, h2 = sorted(pair)          # deterministic: lower idx first
+        base = h_shifts.get(h1, h_shifts.get(h2))
+        if base is None:
+            continue
+        delta = abs(rng.gauss(0, _DIAST_SIGMA))
+        h_shifts_eff[h1] = base + delta
+        h_shifts_eff[h2] = base - delta
+        split_atoms.add(h1)
+        split_atoms.add(h2)
+
+    result = dict(shift_result)
+    result["h_shifts"]     = h_shifts_eff
+    result["_split_atoms"] = split_atoms
+    return result
+
+
+def _get_h_groups_with_splits(mol_with_hs, split_atoms: set) -> dict:
+    """
+    Like _get_equivalent_h_groups but places each split atom into its own
+    singleton group so it acts as an independent NMR signal.
+    """
+    ranks = list(Chem.CanonicalRankAtoms(mol_with_hs, breakTies=False))
+    max_rank = max(ranks) + 1
+    groups: dict[int, list] = defaultdict(list)
+    counter = max_rank
+    for atom in mol_with_hs.GetAtoms():
+        if atom.GetAtomicNum() != 1:
+            continue
+        idx = atom.GetIdx()
+        if idx in split_atoms:
+            groups[counter].append(idx)  # unique group per split proton
+            counter += 1
+        else:
+            groups[ranks[idx]].append(idx)
+    return dict(groups)
+
+
 def _representative(group_idxs: list) -> int:
     """Canonical representative of an equivalence group = lowest index."""
     return min(group_idxs)
@@ -45,7 +147,7 @@ def _representative(group_idxs: list) -> int:
 # Public API
 # ---------------------------------------------------------------------------
 
-def build_hsqc(shift_result: dict) -> list:
+def build_hsqc(shift_result: dict, random_seed: int = 42) -> list:
     """
     Build HSQC peak list from shift predictions.
 
@@ -53,16 +155,22 @@ def build_hsqc(shift_result: dict) -> list:
     One peak per unique H equivalence group that is bonded to a carbon.
     n_h = number of equivalent H in the group.
 
+    Diastereotopic CH₂ protons receive a small random ±δ split so they
+    appear as two peaks at the same ¹³C but slightly different ¹H shifts,
+    matching real HSQC behaviour for chiral molecules.
+
     Returns:
         [{"h_ppm": float, "c_ppm": float, "n_h": int}, ...]
         Sorted by h_ppm ascending.
     """
-    mol   = shift_result["mol_with_hs"]
-    h_shifts = shift_result["h_shifts"]
-    c_shifts = shift_result["c_shifts"]
+    sr       = apply_diastereotopic_splits(shift_result, random_seed)
+    mol      = sr["mol_with_hs"]
+    h_shifts = sr["h_shifts"]
+    c_shifts = sr["c_shifts"]
+    split_atoms = sr.get("_split_atoms", set())
 
-    dist = _get_graph_distances(mol)
-    h_groups = _get_equivalent_h_groups(mol)
+    dist     = _get_graph_distances(mol)
+    h_groups = _get_h_groups_with_splits(mol, split_atoms)
 
     peaks = []
     seen_peaks = set()
@@ -100,23 +208,28 @@ def build_hsqc(shift_result: dict) -> list:
     return sorted(peaks, key=lambda p: p["h_ppm"])
 
 
-def build_hmbc(shift_result: dict) -> list:
+def build_hmbc(shift_result: dict, random_seed: int = 42) -> list:
     """
     Build HMBC peak list (2–3 bond H–C correlations).
 
     For each unique H equivalence group, find all C atoms at graph distance
     2 or 3. Exclude the 1-bond partner (HSQC peak).
 
+    Diastereotopic CH₂ protons appear at their individually split H shifts
+    (same offsets as in build_hsqc for the same random_seed).
+
     Returns:
         [{"h_ppm": float, "c_ppm": float}, ...]
         Sorted by h_ppm ascending, then c_ppm ascending.
     """
-    mol      = shift_result["mol_with_hs"]
-    h_shifts = shift_result["h_shifts"]
-    c_shifts = shift_result["c_shifts"]
+    sr       = apply_diastereotopic_splits(shift_result, random_seed)
+    mol      = sr["mol_with_hs"]
+    h_shifts = sr["h_shifts"]
+    c_shifts = sr["c_shifts"]
+    split_atoms = sr.get("_split_atoms", set())
 
-    dist    = _get_graph_distances(mol)
-    h_groups = _get_equivalent_h_groups(mol)
+    dist     = _get_graph_distances(mol)
+    h_groups = _get_h_groups_with_splits(mol, split_atoms)
 
     peaks = []
     seen_peaks = set()
@@ -152,7 +265,7 @@ def build_hmbc(shift_result: dict) -> list:
     return sorted(peaks, key=lambda p: (p["h_ppm"], p["c_ppm"]))
 
 
-def build_cosy(shift_result: dict) -> list:
+def build_cosy(shift_result: dict, random_seed: int = 42) -> list:
     """
     Build COSY peak list (2–3 bond H–H correlations).
 
@@ -160,15 +273,20 @@ def build_cosy(shift_result: dict) -> list:
     (h1_ppm, h2_ppm) and (h2_ppm, h1_ppm). Diagonal peaks excluded.
     Pairs within the same equivalence group excluded.
 
+    Diastereotopic CH₂ protons receive the same per-atom ±δ offsets as in
+    build_hsqc / build_hmbc (same random_seed → same shifts).
+
     Returns:
         [{"h1_ppm": float, "h2_ppm": float}, ...]
         Sorted by h1_ppm ascending, then h2_ppm ascending.
     """
-    mol      = shift_result["mol_with_hs"]
-    h_shifts = shift_result["h_shifts"]
+    sr       = apply_diastereotopic_splits(shift_result, random_seed)
+    mol      = sr["mol_with_hs"]
+    h_shifts = sr["h_shifts"]
+    split_atoms = sr.get("_split_atoms", set())
 
     dist     = _get_graph_distances(mol)
-    h_groups = _get_equivalent_h_groups(mol)
+    h_groups = _get_h_groups_with_splits(mol, split_atoms)
 
     group_list = list(h_groups.values())
     peaks = []

@@ -245,8 +245,13 @@ def test_constraints_hmbc_excludes_self_group():
     assert not any(abs(cp - 128.5) < 0.5 for cp in c_ppms_targeted)
 
 
-def test_constraints_hmbc_one_per_peak():
-    """One HMBC constraint per NMR peak (not one per atom in expanded group)."""
+def test_constraints_hmbc_all_atoms_per_peak():
+    """HMBC constraint applied to all atoms in an equivalent group per NMR peak.
+
+    A single NMR peak from an expanded group (n_h=2 aromatic → 2 atoms) should
+    generate one HMBC constraint per atom so that every member of the group is
+    properly constrained in LSD.
+    """
     problem = {
         "molecular_formula": "",
         "spectra": {
@@ -269,8 +274,8 @@ def test_constraints_hmbc_one_per_peak():
         'group_c_ppm': 137.0, 'group_h_ppm': None,
     })
     constraints = extract_constraints(problem, nodes)
-    # Should get exactly 1 HMBC per NMR peak
-    assert len(constraints["hmbc"]) == 1
+    # Both atoms in the equivalent group should each get a constraint → 2 total
+    assert len(constraints["hmbc"]) == 2
 
 
 # ---------------------------------------------------------------------------

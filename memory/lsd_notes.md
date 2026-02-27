@@ -39,7 +39,10 @@ Use `_C_QUAT_TOL = 0.25` ppm (tight) to avoid merging nearby quat C into CH peak
 Example: in 4-methoxyacetophenone, ipso-quat at 130.1 ppm is only 0.3 ppm from
 meta-CH at 129.8 ppm. With 1.0 ppm tolerance (too loose), quat is missed.
 
-## Tested Molecules
+## Tested Molecules (after HMBC all-atoms fix)
 - Ethane (C2H6): 1 solution → "CC"
-- Acetophenone (C8H8O): 2 solutions, GT rank 1
-- 4-methoxyacetophenone (C9H10O2): 43 solutions, GT rank 1
+- Acetophenone (C8H8O): 1 solution, GT rank 1
+- 4-methoxyacetophenone (C9H10O2): 4 solutions, GT rank 1
+- Ibuprofen (C13H18O2): 1 solution, GT rank 1
+- Menthol (C10H20O): 1 solution, GT rank 1
+- Ethyl benzoate (C9H10O2): 1 solution, GT rank 1
