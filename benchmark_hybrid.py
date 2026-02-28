@@ -47,11 +47,63 @@ from score_answer import tanimoto_similarity
 # Paths
 # ---------------------------------------------------------------------------
 
-_DIR            = os.path.dirname(os.path.abspath(__file__))
-TESTSET_PATH    = os.path.join(_DIR, "data", "npmrd_testset.json")
-V2_TESTSET_PATH = os.path.join(_DIR, "data", "npmrd_v2_testset.json")
-ZIP_PATH        = os.path.join(_DIR, "data", "assignment_tables.zip")
-OUTPUT_DIR      = os.path.join(_DIR, "outputs")
+_DIR              = os.path.dirname(os.path.abspath(__file__))
+TESTSET_PATH      = os.path.join(_DIR, "data", "npmrd_testset.json")
+V2_TESTSET_PATH   = os.path.join(_DIR, "data", "npmrd_v2_testset.json")
+ZIP_PATH          = os.path.join(_DIR, "data", "assignment_tables.zip")
+OUTPUT_DIR        = os.path.join(_DIR, "outputs")
+SHIFT_CACHE_PATH  = os.path.join(_DIR, "data", "predict_shifts_cache.json")
+GEN_CACHE_PATH    = os.path.join(_DIR, "data", "generate_problem_cache.json")
+
+
+# ---------------------------------------------------------------------------
+# Predict-shifts cache (persisted across runs)
+# ---------------------------------------------------------------------------
+
+def _load_shift_cache() -> dict:
+    """Load cached predict_shifts results from disk, or return empty dict."""
+    if os.path.exists(SHIFT_CACHE_PATH):
+        try:
+            with open(SHIFT_CACHE_PATH) as f:
+                raw = json.load(f)
+            # JSON serialises dict keys as strings; convert back to int for shift dicts.
+            result = {}
+            for smi, entry in raw.items():
+                result[smi] = {
+                    "c_shifts": {int(k): v for k, v in (entry.get("c_shifts") or {}).items()},
+                    "h_shifts": {int(k): v for k, v in (entry.get("h_shifts") or {}).items()},
+                }
+            return result
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_shift_cache(cache: dict) -> None:
+    """Persist predict_shifts cache to disk (atomic write via temp file)."""
+    tmp = SHIFT_CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache, f)
+    os.replace(tmp, SHIFT_CACHE_PATH)
+
+
+def _load_gen_cache() -> dict:
+    """Load cached generate_problem results from disk, or return empty dict."""
+    if os.path.exists(GEN_CACHE_PATH):
+        try:
+            with open(GEN_CACHE_PATH) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_gen_cache(cache: dict) -> None:
+    """Persist generate_problem cache to disk (atomic write via temp file)."""
+    tmp = GEN_CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cache, f)
+    os.replace(tmp, GEN_CACHE_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +431,8 @@ def _molecular_formula(mol) -> str:
 def run_compound(entry: dict, zf: zipfile.ZipFile,
                  chsqc_map: dict, assign_map: dict,
                  max_candidates: int = 50,
-                 lsd_timeout: int = 30) -> dict:
+                 lsd_timeout: int = 30,
+                 shift_cache: dict = None) -> dict:
     """
     Run the hybrid elucidation pipeline for one compound.
 
@@ -432,10 +485,19 @@ def run_compound(entry: dict, zf: zipfile.ZipFile,
         if len(c_shifts_merged) < formula_c:
             try:
                 canon_smi = Chem.MolToSmiles(mol)
-                pred = predict_shifts(canon_smi, backend='nmrshiftdb')
+                if shift_cache is not None and canon_smi in shift_cache:
+                    pred = shift_cache[canon_smi]
+                else:
+                    pred = predict_shifts(canon_smi, backend='nmrshiftdb')
+                    if shift_cache is not None:
+                        # Only store JSON-serialisable fields; skip Mol objects etc.
+                        shift_cache[canon_smi] = {
+                            "c_shifts": {str(k): v for k, v in (pred.get("c_shifts") or {}).items()},
+                            "h_shifts": {str(k): v for k, v in (pred.get("h_shifts") or {}).items()},
+                        }
                 for idx, c_ppm in (pred.get('c_shifts') or {}).items():
-                    if idx not in c_shifts_merged:
-                        c_shifts_merged[idx] = c_ppm
+                    if int(idx) not in c_shifts_merged:
+                        c_shifts_merged[int(idx)] = c_ppm
             except (BackendError, Exception):
                 pass  # fall through; quaternary C will be detected via HMBC only
 
@@ -561,6 +623,9 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
                 if e["np_mrd_id"] in chsqc_map and e["np_mrd_id"] in assign_map]
     print(f"Running hybrid benchmark on {len(runnable)}/{len(testset)} compounds …\n")
 
+    shift_cache = _load_shift_cache()
+    print(f"Shift cache: {len(shift_cache)} entries loaded from {SHIFT_CACHE_PATH}\n")
+
     results = []
     with zipfile.ZipFile(zip_path) as zf:
         for i, entry in enumerate(runnable, 1):
@@ -568,8 +633,10 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
             n_c  = entry.get("n_carbons", "?")
             print(f"[{i:2d}/{len(runnable)}] {npid} ({n_c}C) … ", end="", flush=True)
 
-            r = run_compound(entry, zf, chsqc_map, assign_map, max_candidates, lsd_timeout)
+            r = run_compound(entry, zf, chsqc_map, assign_map, max_candidates,
+                             lsd_timeout, shift_cache)
             results.append(r)
+            _save_shift_cache(shift_cache)  # persist after each compound
 
             if r.get("error"):
                 print(f"ERROR: {r['error'].splitlines()[-1]}")
@@ -634,6 +701,268 @@ def run_benchmark(testset_path: str = TESTSET_PATH,
 
 
 # ---------------------------------------------------------------------------
+# Measurement-noise injection for simulated spectra
+# ---------------------------------------------------------------------------
+
+def _add_measurement_noise(problem: dict,
+                           sigma_h: float = 0.02,
+                           sigma_c: float = 0.05,
+                           random_seed: int = 42) -> dict:
+    """
+    Add independent Gaussian measurement noise to every peak coordinate.
+
+    Each coordinate gets its own draw from N(0, σ), modelling the
+    digitisation/processing error of each individually measured FID point.
+    The same resonance therefore appears at slightly different positions in
+    HSQC vs HMBC (and between different HMBC peaks for the same nucleus),
+    as in real 2D NMR where indirect-dimension points are independently
+    quantised in each experiment.
+
+    Practical upper limits imposed by the solver's matching tolerances:
+      sigma_h < 0.025 ppm  (_H_PPM_TOL = 0.05; larger → H-constraints missed)
+      sigma_c < 0.08 ppm   (_C_QUAT_TOL = 0.25; larger → spurious quat-C nodes)
+    Studying noise beyond these limits requires also widening those tolerances.
+
+    Args:
+        problem:     Problem dict as returned by generate_problem().
+        sigma_h:     Gaussian σ for ¹H coordinates in ppm (default 0.02).
+        sigma_c:     Gaussian σ for ¹³C coordinates in ppm (default 0.05).
+        random_seed: Seed for reproducibility.
+
+    Returns:
+        New problem dict with noisy peak coordinates; original is unchanged.
+    """
+    import random as _rnd
+    rng = _rnd.Random(random_seed + 999)   # distinct from diastereotopic seed
+
+    def n_h(): return rng.gauss(0, sigma_h)
+    def n_c(): return rng.gauss(0, sigma_c)
+
+    spectra = problem.get("spectra", {})
+    noisy_spectra = dict(spectra)
+
+    noisy_spectra["hsqc"] = [
+        {"h_ppm": round(p["h_ppm"] + n_h(), 4),
+         "c_ppm": round(p["c_ppm"] + n_c(), 4),
+         "n_h":   p["n_h"]}
+        for p in spectra.get("hsqc", [])
+    ]
+    noisy_spectra["hmbc"] = [
+        {"h_ppm": round(p["h_ppm"] + n_h(), 4),
+         "c_ppm": round(p["c_ppm"] + n_c(), 4)}
+        for p in spectra.get("hmbc", [])
+    ]
+    noisy_spectra["cosy"] = [
+        {"h1_ppm": round(p["h1_ppm"] + n_h(), 4),
+         "h2_ppm": round(p["h2_ppm"] + n_h(), 4)}
+        for p in spectra.get("cosy", [])
+    ]
+    if "c13" in spectra:
+        noisy_spectra["c13"] = [
+            {**entry, "c_ppm": round(entry["c_ppm"] + n_c(), 4)}
+            for entry in spectra["c13"]
+        ]
+
+    noisy = dict(problem)
+    noisy["spectra"] = noisy_spectra
+    return noisy
+
+
+# ---------------------------------------------------------------------------
+# Fully-simulated benchmark (generate_problem → LSD, no ZIP needed)
+# ---------------------------------------------------------------------------
+
+def run_simulated_compound(entry: dict, backend: str = "nmrdb",
+                           lsd_timeout: int = 30, max_candidates: int = 50,
+                           gen_cache: dict = None,
+                           sigma_h: float = 0.0, sigma_c: float = 0.0) -> dict:
+    """
+    Run LSD on a fully-simulated problem (no experimental data).
+
+    Calls generate_problem(smiles, backend) to obtain HSQC/HMBC/COSY, then
+    runs the same LSD pipeline as run_compound.  Results are cached by
+    (canonical_smiles, backend) in gen_cache so re-runs skip the API call.
+
+    If sigma_h > 0 or sigma_c > 0, Gaussian measurement noise is injected
+    into the peak coordinates after loading from cache (the cache always
+    stores the clean, noiseless problem).
+    """
+    from generate_problem import generate_problem
+
+    npid   = entry["np_mrd_id"]
+    smiles = entry["smiles"]
+    result_base = {"np_mrd_id": npid, "smiles": smiles, "error": None}
+
+    try:
+        mol       = Chem.MolFromSmiles(smiles)
+        formula   = _molecular_formula(mol)
+        canon_smi = Chem.MolToSmiles(mol)
+
+        cache_key = f"{canon_smi}|{backend}"
+        if gen_cache is not None and cache_key in gen_cache:
+            problem = gen_cache[cache_key]
+        else:
+            problem = generate_problem(canon_smi, npid, backend=backend, random_seed=42)
+            if gen_cache is not None:
+                gen_cache[cache_key] = problem
+
+        # Apply measurement noise after cache lookup (cache stores clean data).
+        if sigma_h > 0.0 or sigma_c > 0.0:
+            problem = _add_measurement_noise(problem, sigma_h, sigma_c, random_seed=42)
+
+        spectra = problem.get("spectra", {})
+        hsqc = spectra.get("hsqc", [])
+        hmbc = spectra.get("hmbc", [])
+        cosy = spectra.get("cosy", [])
+        c13  = spectra.get("c13",  [])
+
+        atom_nodes  = extract_atom_nodes(problem)
+        constraints = extract_constraints(problem, atom_nodes)
+        fragments   = detect_fragments(atom_nodes, formula)
+        smiles_list, lsd_text, lsd_pass = run_lsd_iterative(
+            atom_nodes, constraints, fragments, formula, lsd_timeout=lsd_timeout,
+        )
+        lsd_count = len(smiles_list)
+
+        base_fields = {
+            "formula":  formula,
+            "n_hsqc":   len(hsqc),
+            "n_c13":    len(c13),
+            "n_hmbc":   len(hmbc),
+            "n_cosy":   len(cosy),
+            "lsd_pass": lsd_pass,
+        }
+
+        if lsd_count == 0:
+            return {**result_base, **base_fields,
+                    "lsd_count": 0, "gt_rank": None, "gt_tanimoto": None,
+                    "candidates": []}
+
+        if lsd_count <= max_candidates:
+            candidates = rank_candidates(smiles_list, atom_nodes, problem)
+        else:
+            candidates = [
+                {"smiles": s, "score": None, "rank": i + 1}
+                for i, s in enumerate(smiles_list[:max_candidates])
+            ]
+
+        gt_rank     = None
+        gt_tanimoto = None
+        for cand in candidates:
+            t = tanimoto_similarity(cand["smiles"], smiles)
+            if gt_tanimoto is None or t > gt_tanimoto:
+                gt_tanimoto = t
+                if t >= 0.99:
+                    gt_rank = cand["rank"]
+
+        return {
+            **result_base,
+            **base_fields,
+            "lsd_count":   lsd_count,
+            "gt_rank":     gt_rank,
+            "gt_tanimoto": round(gt_tanimoto, 4) if gt_tanimoto else None,
+            "candidates":  candidates[:10],
+            "lsd_text":    lsd_text,
+        }
+
+    except Exception as exc:
+        import traceback
+        return {**result_base, "error": traceback.format_exc(), "lsd_count": 0}
+
+
+def run_simulated_benchmark(testset_path: str,
+                            backend: str = "nmrdb",
+                            output_dir: str = OUTPUT_DIR,
+                            max_candidates: int = 50,
+                            output_prefix: str = "simulated_benchmark",
+                            lsd_timeout: int = 30,
+                            sigma_h: float = 0.0,
+                            sigma_c: float = 0.0) -> None:
+
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path  = os.path.join(output_dir, f"{output_prefix}.csv")
+    json_path = os.path.join(output_dir, f"{output_prefix}.json")
+
+    with open(testset_path) as f:
+        testset = json.load(f)
+
+    gen_cache = _load_gen_cache()
+    cached = sum(1 for e in testset
+                 if f"{Chem.MolToSmiles(Chem.MolFromSmiles(e['smiles']))}|{backend}" in gen_cache)
+    noise_str = (f"σ_H={sigma_h} ppm, σ_C={sigma_c} ppm"
+                 if (sigma_h or sigma_c) else "none")
+    print(f"Generate-problem cache: {len(gen_cache)} total entries, "
+          f"{cached}/{len(testset)} testset compounds already cached")
+    print(f"Measurement noise: {noise_str}\n")
+
+    results = []
+    for i, entry in enumerate(testset, 1):
+        npid = entry["np_mrd_id"]
+        n_c  = entry.get("n_carbons", "?")
+        print(f"[{i:2d}/{len(testset)}] {npid} ({n_c}C) … ", end="", flush=True)
+
+        r = run_simulated_compound(entry, backend, lsd_timeout, max_candidates,
+                                    gen_cache, sigma_h, sigma_c)
+        results.append(r)
+        _save_gen_cache(gen_cache)
+
+        if r.get("error"):
+            print(f"ERROR: {r['error'].splitlines()[-1]}")
+        else:
+            rank_str = (f"rank={r['gt_rank']}" if r["gt_rank"]
+                        else f"tanimoto={r['gt_tanimoto']}")
+            c13_str  = f", C13={r.get('n_c13', '-')}" if r.get('n_c13') else ""
+            print(f"LSD={r['lsd_count']} solutions ({r.get('lsd_pass','?')}), GT {rank_str}  "
+                  f"[HSQC={r['n_hsqc']}{c13_str}, HMBC={r['n_hmbc']}, COSY={r['n_cosy']}]")
+
+    # --- Summary ---
+    n_ok      = sum(1 for r in results if not r.get("error"))
+    n_found   = sum(1 for r in results if r.get("gt_rank") is not None)
+    n_rank1   = sum(1 for r in results if r.get("gt_rank") == 1)
+    lsd_counts   = [r["lsd_count"] for r in results if not r.get("error") and "lsd_count" in r]
+    gt_tanimotos = [r["gt_tanimoto"] for r in results if r.get("gt_tanimoto") is not None]
+
+    print(f"\n{'='*60}")
+    print(f"Results: {n_ok}/{len(testset)} ran successfully")
+    print(f"  GT found (Tanimoto≥0.99): {n_found}/{n_ok}")
+    print(f"  GT rank=1:                {n_rank1}/{n_ok}")
+    if lsd_counts:
+        import math
+        avg_log = sum(math.log10(max(c, 1)) for c in lsd_counts) / len(lsd_counts)
+        print(f"  Median LSD solutions:     {sorted(lsd_counts)[len(lsd_counts)//2]}")
+        print(f"  Mean log10(solutions):    {avg_log:.2f}")
+    if gt_tanimotos:
+        print(f"  Mean GT Tanimoto:         {sum(gt_tanimotos)/len(gt_tanimotos):.3f}")
+
+    rank_hist: dict = defaultdict(int)
+    for r in results:
+        if r.get("gt_rank"):
+            rank_hist[r["gt_rank"]] += 1
+    if rank_hist:
+        print(f"  Rank distribution: " +
+              ", ".join(f"#{k}:{v}" for k, v in sorted(rank_hist.items())))
+    print()
+
+    # --- Save CSV ---
+    csv_fields = [
+        "np_mrd_id", "smiles", "formula",
+        "n_hsqc", "n_c13", "n_hmbc", "n_cosy",
+        "lsd_count", "lsd_pass", "gt_rank", "gt_tanimoto", "error",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=csv_fields, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(results)
+    print(f"Saved → {csv_path}")
+
+    # --- Save JSON ---
+    json_results = [{k: v for k, v in r.items() if k != "lsd_text"} for r in results]
+    with open(json_path, "w") as f:
+        json.dump(json_results, f, indent=2, default=str)
+    print(f"Saved → {json_path}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -646,20 +975,37 @@ def _cli() -> None:
                    help="Use v2 testset (npmrd_v2_testset.json) with 1D 13C support")
     p.add_argument("--zip",            default=ZIP_PATH)
     p.add_argument("--output-dir",     default=OUTPUT_DIR)
+    p.add_argument("--output-prefix",  default=None,
+                   help="Output file prefix (default: derived from testset flag)")
     p.add_argument("--max-candidates", type=int, default=50)
     p.add_argument("--lsd-timeout",    type=int, default=30,
                    help="LSD timeout in seconds per pass (default 30)")
+    p.add_argument("--simulated",      action="store_true",
+                   help="Use fully-simulated data (generate_problem) instead of experimental ZIP")
+    p.add_argument("--backend",        default="nmrdb",
+                   help="Shift-prediction backend for --simulated mode (default: nmrdb)")
+    p.add_argument("--sigma-h",        type=float, default=0.0,
+                   help="Gaussian noise σ for ¹H shifts in ppm (default 0, no noise)")
+    p.add_argument("--sigma-c",        type=float, default=0.0,
+                   help="Gaussian noise σ for ¹³C shifts in ppm (default 0, no noise)")
     args = p.parse_args()
 
-    if args.v2:
+    if args.simulated:
+        testset = args.testset or TESTSET_PATH
+        prefix  = args.output_prefix or f"simulated_{args.backend}_benchmark"
+        run_simulated_benchmark(testset, args.backend, args.output_dir,
+                                args.max_candidates, prefix, args.lsd_timeout,
+                                args.sigma_h, args.sigma_c)
+    elif args.v2:
         testset = args.testset or V2_TESTSET_PATH
-        prefix  = "hybrid_v2_benchmark"
+        prefix  = args.output_prefix or "hybrid_v2_benchmark"
+        run_benchmark(testset, args.zip, args.output_dir, args.max_candidates, prefix,
+                      args.lsd_timeout)
     else:
         testset = args.testset or TESTSET_PATH
-        prefix  = "hybrid_benchmark"
-
-    run_benchmark(testset, args.zip, args.output_dir, args.max_candidates, prefix,
-                  args.lsd_timeout)
+        prefix  = args.output_prefix or "hybrid_benchmark"
+        run_benchmark(testset, args.zip, args.output_dir, args.max_candidates, prefix,
+                      args.lsd_timeout)
 
 
 if __name__ == "__main__":

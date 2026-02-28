@@ -69,6 +69,26 @@ Now all atoms in the group get the HMBC constraint. This was the root cause of:
 - menthol 52 solutions → 1 (equivalent CH3 groups were unconstrained)
 - 4-methoxyacetophenone 43 → 4, 4-aminobenzoic_acid 38 → 5, etc.
 
+## Benchmarking infrastructure (benchmark_hybrid.py)
+- `--simulated --backend nmrdb`: fully-simulated mode via generate_problem() instead of ZIP
+- `--output-prefix <name>`: controls output filenames to avoid overwriting
+- `--sigma-h / --sigma-c`: Gaussian noise σ for ¹H/¹³C shifts (per-resonance correlated model)
+- Caches: `data/predict_shifts_cache.json` (NMRShiftDB quat-C), `data/generate_problem_cache.json` (API results)
+- `data/npmrd_dbe_lt3_testset.json`: 38 compounds (5-7C, DBE<3 — sugars/amino acids/acids/alcohols/quat-ammonium)
+- DBE<3 3-way comparison (n=37): exp rank=1 47%, sim(noiseless) 62%, sim(σ_H=0.05 σ_C=0.5) 62%
+- Noise σ_H=0.05/σ_C=0.5 has no effect on LSD performance: topology preserved since per-resonance offsets
+- Experimental gap (~15 pp) is due to API prediction errors + solvent effects, not measurement noise
+- Quaternary ammonium: 0% in both modes (LSD can't handle [N+]/[O-] formal charges)
+- Filter funnel (5-7C): 152 with CHSQC → 58 at 5-7C → 20 pass DBE≥3 → 11 pass ≥3 peaks → 11 pass ≤3 close-pairs
+
+## Noise model (_add_measurement_noise in benchmark_hybrid.py)
+- Per-peak independent: each coordinate gets its own N(0,σ) draw — physically correct for digitisation noise
+- Defaults: sigma_h=0.02 ppm, sigma_c=0.05 ppm
+- Solver tolerance constraints: σ_C < _C_QUAT_TOL/3√2 ≈ 0.06 (larger → spurious quat-C); σ_H < _H_PPM_TOL/3√2 ≈ 0.012 (larger → missed H-constraints)
+- At σ_H=0.02: ~8% H-constraints missed per peak (measurable degradation); at σ_C=0.05: <0.04% spurious quat-C
+- DBE<3 4-way: noiseless=62%, per-resonance(0.05/0.5)=62%, per-peak(0.02/0.05)=41%, experimental=47%
+- Per-peak noise at σ_H=0.02 drops rank=1 to 41% (below exp 47%), showing COSY H-constraint misses compound
+
 ## Running
 ```
 uv run python generate_problem.py SMILES
